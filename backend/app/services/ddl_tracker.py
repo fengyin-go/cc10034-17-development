@@ -29,29 +29,13 @@ class DdlTrackerService(BaseModuleService):
 
         解析 DDL 语句中的列变化、分区变化、索引变化，
         产出影响报告供 schema_sync 和 partition_sync 消费。
+        每条列变更都带改列动作（add/drop/rename/modify）和原始位点。
         """
-        ddl_text = ddl.ddl_statement.upper()
-        column_changes: list[dict[str, Any]] = []
+        column_changes: list[dict[str, Any]] = self._parse_column_changes(ddl.ddl_statement)
+        ddl.column_changes = [dict(cc) for cc in column_changes]
+
         partition_changes: list[dict[str, Any]] = []
-
-        # 检测 ADD COLUMN
-        add_cols = re.findall(r'ADD\s+COLUMN\s+(\w+)\s+(\w+)', ddl_text, re.IGNORECASE)
-        for col_name, col_type in add_cols:
-            column_changes.append({"action": "add", "column": col_name, "type": col_type})
-            ddl.column_changes.append({"action": "add", "column": col_name, "type": col_type})
-
-        # 检测 DROP COLUMN
-        drop_cols = re.findall(r'DROP\s+(?:COLUMN\s+)?(\w+)', ddl_text, re.IGNORECASE)
-        for col_name in drop_cols:
-            column_changes.append({"action": "drop", "column": col_name})
-            ddl.column_changes.append({"action": "drop", "column": col_name})
-
-        # 检测 MODIFY COLUMN / CHANGE COLUMN
-        modify_cols = re.findall(r'(?:MODIFY|CHANGE)\s+(?:COLUMN\s+)?(\w+)\s+(\w+)\s+(\w+)',
-                                 ddl_text, re.IGNORECASE)
-        for old_name, new_name, col_type in modify_cols:
-            column_changes.append({"action": "modify", "column": old_name, "new_type": col_type})
-            ddl.column_changes.append({"action": "modify", "column": old_name, "new_type": col_type})
+        ddl_text = ddl.ddl_statement.upper()
 
         # 检测 ADD PARTITION
         add_part = re.findall(r'ADD\s+PARTITION', ddl_text, re.IGNORECASE)
@@ -78,26 +62,105 @@ class DdlTrackerService(BaseModuleService):
             "rollback_statement": rollback,
             "has_schema_impact": len(column_changes) > 0,
             "has_partition_impact": len(partition_changes) > 0,
+            "source_position": {
+                "binlog_file": ddl.binlog_file,
+                "binlog_position": ddl.binlog_position,
+            },
             "analyzed_at": datetime.now().isoformat(),
         }
 
-        # 对 schema_sync 有影响的DDL，写入管道供冲突检测消费
+        # 对 schema_sync 有影响的DDL，写入管道供批量结构同步按位点归并消费
         if impact["has_schema_impact"]:
             for cc in column_changes:
                 pipeline_bus.schema_registry.setdefault(ddl.table_name, []).append({
+                    "record_id": ddl.record_id,
                     "column": cc.get("column"),
+                    "new_column": cc.get("new_column", ""),
                     "action": cc.get("action"),
                     "type": cc.get("type", ""),
+                    "binlog_file": ddl.binlog_file,
+                    "binlog_position": ddl.binlog_position,
                     "timestamp": datetime.now().isoformat(),
                 })
 
         pipeline_bus.add_ddl(ddl)
         pipeline_bus.write_audit(
             "DDL分析", f"{ddl.database}.{ddl.table_name}",
-            f"分析DDL影响：列变更{affected_cols}，分区变更{len(partition_changes)}",
+            f"分析DDL影响：列变更{affected_cols}，分区变更{len(partition_changes)}，"
+            f"位点 {ddl.binlog_file}:{ddl.binlog_position}",
             "ddl_tracker", "已分析"
         )
         return impact
+
+    def _parse_column_changes(self, ddl_stmt: str) -> list[dict[str, Any]]:
+        """解析一条 DDL 内的全部列变更，统一输出 add/drop/rename/modify 动作。
+
+        - RENAME COLUMN a TO b / CHANGE a b（同类型或未给类型）→ rename
+        - CHANGE a b 带新类型 → rename + modify（更名与类型调整拆开，保留交叠来源）
+        - MODIFY COLUMN a T → modify
+        - ADD COLUMN a T → add
+        - DROP COLUMN a → drop（排除 DROP PARTITION）
+        """
+        changes: list[dict[str, Any]] = []
+        text = ddl_stmt
+        # 类型词允许括号参数与内部逗号，如 DECIMAL(12,2)、VARCHAR(32)
+        type_token = r'[\w]+(?:\s*\([^)]*\))?'
+
+        for match in re.finditer(
+            rf'ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+({type_token})',
+            text, re.IGNORECASE,
+        ):
+            changes.append({
+                "action": "add",
+                "column": match.group(1),
+                "type": match.group(2).strip(),
+            })
+
+        for match in re.finditer(r'RENAME\s+COLUMN\s+(\w+)\s+TO\s+(\w+)', text, re.IGNORECASE):
+            changes.append({
+                "action": "rename",
+                "column": match.group(1),
+                "new_column": match.group(2),
+            })
+
+        for match in re.finditer(
+            rf'CHANGE\s+(?:COLUMN\s+)?(\w+)\s+(\w+)(?:\s+({type_token}))?',
+            text, re.IGNORECASE,
+        ):
+            old_name, new_name, col_type = match.group(1), match.group(2), match.group(3)
+            col_type = (col_type or "").strip()
+            if old_name != new_name:
+                changes.append({"action": "rename", "column": old_name, "new_column": new_name})
+                if col_type:
+                    changes.append({
+                        "action": "modify",
+                        "column": new_name,
+                        "new_column": new_name,
+                        "type": col_type,
+                    })
+            elif col_type:
+                changes.append({
+                    "action": "modify",
+                    "column": old_name,
+                    "new_column": old_name,
+                    "type": col_type,
+                })
+
+        for match in re.finditer(
+            rf'MODIFY\s+(?:COLUMN\s+)?(\w+)\s+({type_token})',
+            text, re.IGNORECASE,
+        ):
+            changes.append({
+                "action": "modify",
+                "column": match.group(1),
+                "new_column": match.group(1),
+                "type": match.group(2).strip(),
+            })
+
+        for match in re.finditer(r'DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?(\w+)', text, re.IGNORECASE):
+            changes.append({"action": "drop", "column": match.group(1)})
+
+        return changes
 
     def track_temporal_ddl(self, table_name: str, from_dt: str, to_dt: str) -> list[dict[str, Any]]:
         """查询指定表在时间范围内的DDL变更序列。"""
@@ -116,20 +179,30 @@ class DdlTrackerService(BaseModuleService):
     def generate_rollback(self, ddl_stmt: str) -> str:
         """根据DDL语句生成回滚语句。"""
         ddl_upper = ddl_stmt.upper()
+        rename_match = re.search(r'RENAME\s+COLUMN\s+(\w+)\s+TO\s+(\w+)', ddl_stmt, re.IGNORECASE)
+        if rename_match:
+            return f"ALTER TABLE ... RENAME COLUMN {rename_match.group(2)} TO {rename_match.group(1)};"
         if "ADD COLUMN" in ddl_upper:
             match = re.search(r'ADD\s+COLUMN\s+(\w+)', ddl_stmt, re.IGNORECASE)
             if match:
                 return f"ALTER TABLE ... DROP COLUMN {match.group(1)};"
         if "DROP COLUMN" in ddl_upper:
             return "-- 回滚需从备份恢复列定义"
-        if "MODIFY" in ddl_upper:
-            return "-- 回滚需记录修改前的列类型"
+        if "MODIFY" in ddl_upper or "CHANGE" in ddl_upper:
+            return "-- 回滚需记录修改前的列类型/列名"
         if "ADD PARTITION" in ddl_upper:
             return "ALTER TABLE ... DROP PARTITION ...;"
         return "-- 自动回滚生成中"
 
-    def record_ddl(self, database: str, table_name: str, ddl_stmt: str) -> DdlRecord:
-        """记录并分析一条DDL。"""
+    def record_ddl(
+        self,
+        database: str,
+        table_name: str,
+        ddl_stmt: str,
+        binlog_file: str = "mysql-bin.000001",
+        binlog_position: int = 0,
+    ) -> DdlRecord:
+        """记录并分析一条DDL，保留原始位点供跨日志归并。"""
         ddl = DdlRecord(
             record_id=f"ddl_{uuid.uuid4().hex[:8]}",
             database=database,
@@ -138,9 +211,19 @@ class DdlTrackerService(BaseModuleService):
             executed_at=datetime.now(),
             affected_columns=0,
             rollback_statement=self.generate_rollback(ddl_stmt),
+            binlog_file=binlog_file,
+            binlog_position=binlog_position,
         )
         self.analyze_ddl_impact(ddl)
         return ddl
+
+    def list_ddl_receipts(self, table: str | None = None) -> dict[str, Any]:
+        """DDL 回执清单：Schema同步回写后，据此区分本批已应用与队列中的语句。"""
+        from app.services import SERVICES
+        schema_service = SERVICES.get("schema_sync")
+        if schema_service is None:
+            return {"total": 0, "applied": 0, "queued": 0, "failed": 0, "receipts": []}
+        return schema_service.ddl_queue_view(table)
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry, msg = super().run_action(entry_id, action)

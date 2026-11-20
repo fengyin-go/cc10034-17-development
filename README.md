@@ -77,5 +77,23 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 批量结构同步（schema_sync 跨日志编排）
+
+Schema同步除单份变更登记外，支持把一批表结构变更日志按依赖逐条归并后整批发布，
+接口挂在 `/api/schema-sync/batches` 下（见 `backend/app/routers/schema_batch.py`）：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /ddl` | 登记带原始位点（binlog 文件+偏移）的 DDL，解析 add/drop/rename/modify 改列动作 |
+| `POST /build` | 按位点排序归并一批 DDL，生成批次字段映射数据集与依赖组（不发布） |
+| `POST /{batch_id}/publish` | 向目标引擎发布，结果按 DDL 回写回执清单；失败时整组回滚保留恢复边界 |
+| `POST /{batch_id}/replay` | 重放原批，返回实际生效次数（已生效动作由目标引擎幂等跳过） |
+| `GET /ddl-receipts?table=` | DDL 回执清单，区分「已应用 / 队列中」 |
+| `GET /targets/{target_table}` | 查看目标引擎最终列目录与累计生效动作数 |
+
+归并要点：列名转换后后续类型调整按新列名解析；同一目标列被多段变更交叠写入时
+并入同一映射条目并保留来源位点链；未涉及该列的变更独立成组、可独立发布。
+
+
 领域：数据工程
 子方向：数仓与数据湖

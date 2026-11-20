@@ -70,6 +70,8 @@
       </tbody>
     </table>
 
+    <BatchSyncPanel v-if="meta.key === 'schema_sync'" />
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
@@ -103,6 +105,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import BatchSyncPanel from '@/views/BatchSyncPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()

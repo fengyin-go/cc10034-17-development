@@ -1,6 +1,7 @@
 """跨模块管道状态总线：服务间通过管道层完成事件、位点、Schema 的发布-消费。"""
 from __future__ import annotations
 
+import copy
 import hashlib
 import time
 from collections import defaultdict
@@ -39,6 +40,9 @@ class DdlRecord:
     rollback_statement: str
     column_changes: list[dict[str, Any]] = field(default_factory=list)
     partition_changes: list[dict[str, Any]] = field(default_factory=list)
+    # 原始位点：DDL 在源端 binlog 中的位置，跨日志编排按位点排序
+    binlog_file: str = ""
+    binlog_position: int = 0
 
 
 @dataclass
@@ -115,6 +119,12 @@ class PipelineBus:
             "dedup_hits": 0,
             "backfill_rows": 0,
         }
+        # 批量结构同步 — schema_sync 按批编排 DDL 变更
+        self.batch_datasets: dict[str, dict[str, Any]] = {}
+        # DDL 回执清单 — 按 ddl_record_id 记录每条语句的应用/队列状态
+        self.ddl_receipts: dict[str, dict[str, Any]] = {}
+        # 目标引擎：模拟目标库的列目录，发布在此真实生效并保证幂等
+        self.target_engine: dict[str, dict[str, Any]] = {}
 
     def publish_event(self, event: ChangeEventRecord) -> dict[str, Any]:
         """将解析产出的事件发布到队列。返回发布确认。"""
@@ -156,6 +166,138 @@ class PipelineBus:
     def get_recent_ddls(self, limit: int = 50) -> list[DdlRecord]:
         """查询最近 DDL 记录。"""
         return self.ddl_log[-limit:]
+
+    def find_ddl(self, record_id: str) -> DdlRecord | None:
+        """按记录 ID 查找 DDL。"""
+        for ddl in self.ddl_log:
+            if ddl.record_id == record_id:
+                return ddl
+        return None
+
+    # ------------------------------------------------------------------
+    # 目标引擎：模拟目标库列目录，承担真实发布与幂等去重
+    # ------------------------------------------------------------------
+    def ensure_target_table(self, table: str, initial_columns: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        # 仅在目标表首次创建时播种初始列；已存在的表（含重放场景）不回填，
+        # 否则已被更名/删除的初始列会被错误地重新加回。
+        if table in self.target_engine:
+            return self.target_engine[table]
+        catalog = self.target_engine.setdefault(
+            table,
+            {"columns": {}, "column_order": [], "executed_statements": [], "apply_count": 0},
+        )
+        for col in initial_columns or []:
+            name = col["column"]
+            if name not in catalog["columns"]:
+                catalog["columns"][name] = {"type": col.get("type", "STRING"), "origin": col.get("origin", name)}
+                catalog["column_order"].append(name)
+        return catalog
+
+    def execute_target_ddl(self, table: str, statement: str, change: dict[str, Any]) -> dict[str, Any]:
+        """在目标引擎上执行一条改列动作，返回执行结果（已生效/幂等跳过/失败）。"""
+        catalog = self.ensure_target_table(table)
+        executed = catalog["executed_statements"]
+        normalized = statement.strip()
+        if normalized in executed:
+            # 重复提交已生效的改列动作，目标引擎不会再次执行
+            return {"executed": False, "skipped": True, "reason": "duplicate_statement"}
+
+        action = change.get("action")
+        target_col = change.get("target_column") or change.get("column")
+        source_col = change.get("column")
+        result: dict[str, Any] = {"executed": False, "skipped": False}
+        if action == "rename":
+            new_name = change.get("new_column", target_col)
+            if source_col not in catalog["columns"]:
+                if new_name in catalog["columns"]:
+                    # 更名已生效过（含重放）：目标列已存在即视为幂等命中
+                    result.update(skipped=True, reason="rename_already_applied")
+                else:
+                    result.update(executed=False, error=f"源列 {source_col} 不存在，依赖组恢复边界保留")
+            elif new_name in catalog["columns"]:
+                result.update(skipped=True, reason="target_column_exists")
+            else:
+                catalog["columns"][new_name] = catalog["columns"].pop(source_col)
+                catalog["column_order"] = [new_name if c == source_col else c for c in catalog["column_order"]]
+                result["executed"] = True
+        elif action == "add":
+            if target_col in catalog["columns"]:
+                result.update(skipped=True, reason="column_exists")
+            else:
+                catalog["columns"][target_col] = {"type": change.get("target_type", "STRING"), "origin": source_col}
+                catalog["column_order"].append(target_col)
+                result["executed"] = True
+        elif action == "modify":
+            if target_col not in catalog["columns"]:
+                result.update(executed=False, error=f"目标列 {target_col} 不存在，依赖组恢复边界保留")
+            else:
+                current_type = catalog["columns"][target_col]["type"]
+                wanted_type = change.get("target_type", current_type)
+                if current_type == wanted_type:
+                    # 目标类型已一致：重复提交的改列动作不再执行
+                    result.update(skipped=True, reason="type_already_applied")
+                else:
+                    catalog["columns"][target_col]["type"] = wanted_type
+                    result["executed"] = True
+        elif action == "drop":
+            if source_col not in catalog["columns"]:
+                result.update(skipped=True, reason="column_absent")
+            else:
+                del catalog["columns"][source_col]
+                catalog["column_order"] = [c for c in catalog["column_order"] if c != source_col]
+                result["executed"] = True
+        else:
+            result.update(executed=False, error=f"未知改列动作：{action}")
+
+        if result.get("executed"):
+            executed.append(normalized)
+            catalog["apply_count"] += 1
+        return result
+
+    def target_catalog(self, table: str) -> dict[str, Any]:
+        catalog = self.ensure_target_table(table)
+        return {
+            "table": table,
+            "columns": [
+                {"column": name, "type": catalog["columns"][name]["type"]}
+                for name in catalog["column_order"]
+            ],
+            "apply_count": catalog["apply_count"],
+            "executed_statement_count": len(catalog["executed_statements"]),
+        }
+
+    def snapshot_target(self, table: str) -> dict[str, Any]:
+        """导出目标表当前目录的深拷贝，作为依赖组恢复边界。"""
+        return copy.deepcopy(self.ensure_target_table(table))
+
+    def restore_target(self, table: str, snapshot: dict[str, Any]) -> None:
+        """把目标表恢复到快照边界（含列目录、已执行语句台账和生效计数）。"""
+        self.target_engine[table] = copy.deepcopy(snapshot)
+
+    # ------------------------------------------------------------------
+    # 批量结构同步：批次字段映射数据集与 DDL 回执
+    # ------------------------------------------------------------------
+    def save_batch(self, batch: dict[str, Any]) -> None:
+        self.batch_datasets[batch["batch_id"]] = batch
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return self.batch_datasets.get(batch_id)
+
+    def list_batches(self) -> list[dict[str, Any]]:
+        return list(self.batch_datasets.values())
+
+    def upsert_receipt(self, receipt: dict[str, Any]) -> None:
+        self.ddl_receipts[receipt["ddl_record_id"]] = receipt
+
+    def get_receipt(self, ddl_record_id: str) -> dict[str, Any] | None:
+        return self.ddl_receipts.get(ddl_record_id)
+
+    def list_receipts(self, table: str | None = None) -> list[dict[str, Any]]:
+        receipts = list(self.ddl_receipts.values())
+        if table:
+            receipts = [r for r in receipts if r.get("table") == table]
+        return sorted(receipts, key=lambda r: (r.get("binlog_file", ""), r.get("binlog_position", 0)))
+
 
     def compute_event_hash(self, event: ChangeEventRecord) -> str:
         """计算事件的业务去重哈希。"""
@@ -328,6 +470,9 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "batch_count": len(self.batch_datasets),
+            "ddl_receipt_count": len(self.ddl_receipts),
+            "target_table_count": len(self.target_engine),
         }
 
 
